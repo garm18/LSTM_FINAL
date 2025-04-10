@@ -1,48 +1,54 @@
-from flask import Flask, jsonify
+from flask import Flask, request, jsonify
 import pandas as pd
 import numpy as np
+import pymysql
+import tensorflow as tf
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
-import pymysql
 import pickle
 import os
 
 app = Flask(__name__)
 
-# ---------- KONFIGURASI ----------
-MODEL_PATH = 'model/lstm_rssi_model.h5'
-SCALER_PATH = 'model/scaler.pkl'
-DB_CONFIG = {
+# Konfigurasi
+db_config = {
     "host": "auth-db497.hstgr.io",
     "user": "u731251063_pgn",
     "password": "SmartMeter3",
     "database": "u731251063_pgn"
 }
-WINDOW_SIZE = 10
+MODEL_PATH = "model/lstm_rssi_model.h5"
+SCALER_PATH = "model/scaler.pkl"
 
+# Cek model & scaler
+model = load_model(MODEL_PATH, compile=False) if os.path.exists(MODEL_PATH) else None
+scaler = pickle.load(open(SCALER_PATH, "rb")) if os.path.exists(SCALER_PATH) else None
 
-# ---------- FUNGSI UTIL ----------
 def create_dataset(data, window_size=10):
     X, y = [], []
     for i in range(len(data) - window_size):
         X.append(data[i:i + window_size])
-        y.append(data[i + window_size][0])  # Target: kolom pertama (RSSI)
+        y.append(data[i + window_size][0])
     return np.array(X), np.array(y)
 
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        "status": "running",
+        "model_loaded": model is not None,
+        "scaler_loaded": scaler is not None
+    })
 
-# ---------- ENDPOINT: TRAINING ----------
 @app.route('/train-lstm', methods=['GET'])
 def train_lstm():
     try:
-        conn = pymysql.connect(**DB_CONFIG)
+        conn = pymysql.connect(**db_config)
         query = "SELECT created_at AS timestamp, signal_strength AS rssi FROM logs ORDER BY created_at ASC"
         df = pd.read_sql(query, conn)
         conn.close()
-
-        if df.empty:
-            return jsonify({'error': 'No data found for training'}), 400
 
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df.set_index('timestamp', inplace=True)
@@ -51,43 +57,36 @@ def train_lstm():
         df['time_seconds'] = (df.index - df.index[0]).total_seconds()
 
         features = ['rssi_smooth', 'rssi_prev', 'time_seconds']
-        scaler = MinMaxScaler()
-        scaled = scaler.fit_transform(df[features])
+        scaler_new = MinMaxScaler()
+        scaled = scaler_new.fit_transform(df[features])
 
-        X, y = create_dataset(scaled, window_size=WINDOW_SIZE)
+        X, y = create_dataset(scaled, window_size=10)
+        split = int(len(X) * 0.8)
+        X_train, X_test = X[:split], X[split:]
+        y_train, y_test = y[:split], y[split:]
 
-        train_size = int(0.8 * len(X))
-        X_train, y_train = X[:train_size], y[:train_size]
+        model_new = Sequential()
+        model_new.add(LSTM(64, activation='tanh', input_shape=(10, 3)))
+        model_new.add(Dense(1))
+        model_new.compile(optimizer='adam', loss='mse')
 
-        model = Sequential()
-        model.add(LSTM(64, input_shape=(WINDOW_SIZE, 3)))
-        model.add(Dense(1))
-        model.compile(optimizer='adam', loss='mse')
-        model.fit(X_train, y_train, epochs=10, batch_size=32, verbose=0)
+        model_new.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=20, callbacks=[EarlyStopping(patience=3)], verbose=0)
 
-        # Simpan model dan scaler
-        os.makedirs('model', exist_ok=True)
-        model.save(MODEL_PATH)
-        with open(SCALER_PATH, 'wb') as f:
-            pickle.dump(scaler, f)
+        model_new.save(MODEL_PATH)
+        with open(SCALER_PATH, "wb") as f:
+            pickle.dump(scaler_new, f)
 
-        return jsonify({'message': 'Training berhasil! Model dan scaler disimpan.'})
-
+        return jsonify({"message": "Model retrained successfully!"})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
-
-# ---------- ENDPOINT: PREDIKSI RSSI ----------
 @app.route('/predict-rssi', methods=['GET'])
 def predict_rssi():
     try:
-        conn = pymysql.connect(**DB_CONFIG)
+        conn = pymysql.connect(**db_config)
         query = "SELECT created_at AS timestamp, signal_strength AS rssi FROM logs ORDER BY created_at ASC"
         df = pd.read_sql(query, conn)
         conn.close()
-
-        if df.empty:
-            return jsonify({'error': 'No data available'}), 400
 
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df.set_index('timestamp', inplace=True)
@@ -96,17 +95,16 @@ def predict_rssi():
         df['time_seconds'] = (df.index - df.index[0]).total_seconds()
 
         features = ['rssi_smooth', 'rssi_prev', 'time_seconds']
-        with open(SCALER_PATH, 'rb') as f:
-            scaler = pickle.load(f)
-        scaled = scaler.transform(df[features])
-        X, y_actual = create_dataset(scaled, window_size=WINDOW_SIZE)
+        scaler_loaded = pickle.load(open(SCALER_PATH, 'rb'))
+        scaled = scaler_loaded.transform(df[features])
 
-        model = load_model(MODEL_PATH)
-        y_pred = model.predict(X)
+        X, y_actual = create_dataset(scaled, window_size=10)
+        model_loaded = tf.keras.models.load_model(MODEL_PATH, compile=False)
+        y_pred = model_loaded.predict(X)
 
-        y_actual_inv = scaler.inverse_transform(np.hstack((y_actual.reshape(-1, 1), np.zeros((len(y_actual), 2)))))[:, 0]
-        y_pred_inv = scaler.inverse_transform(np.hstack((y_pred, np.zeros((len(y_pred), 2)))))[:, 0]
-        timestamps = df.index[WINDOW_SIZE:].strftime('%Y-%m-%d %H:%M:%S').tolist()
+        y_actual_inv = scaler_loaded.inverse_transform(np.hstack((y_actual.reshape(-1, 1), np.zeros((len(y_actual), 2)))))[:, 0]
+        y_pred_inv = scaler_loaded.inverse_transform(np.hstack((y_pred, np.zeros((len(y_pred), 2)))))[:, 0]
+        timestamps = df.index[10:].strftime('%Y-%m-%d %H:%M:%S').tolist()
 
         results = []
         for t, a, p in zip(timestamps, y_actual_inv, y_pred_inv):
@@ -121,19 +119,5 @@ def predict_rssi():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-
-# ---------- ENDPOINT: CEK KESEHATAN ----------
-@app.route('/health', methods=['GET'])
-def health_check():
-    model_exists = os.path.exists(MODEL_PATH)
-    scaler_exists = os.path.exists(SCALER_PATH)
-    return jsonify({
-        'status': 'healthy' if model_exists and scaler_exists else 'unhealthy',
-        'model_loaded': model_exists,
-        'scaler_loaded': scaler_exists
-    })
-
-
-# ---------- JALANKAN ----------
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0')
