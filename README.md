@@ -1,4 +1,4 @@
-# Flask API with LSTM Model
+# FLASK API using LSTM Model for Prediction RSSI
 
 This repository contains a Flask-based API implementation that uses an LSTM (Long Short-Term Memory) model for [specific task, e.g., time series prediction, natural language processing, etc.]. The API allows users to interact with the trained model for predictions and other functionalities.
 
